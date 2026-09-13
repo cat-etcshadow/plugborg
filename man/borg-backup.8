@@ -443,7 +443,15 @@ not prevented). Free space ahead of time with
 .BR "borg prune" " and " "borg compact" ,
 tighten
 .BR RETENTION ,
-or move the repo to larger storage.
+or move the repo to larger storage. If the filesystem fills completely,
+.B systemd-journald
+can fail to persist the failing unit's own log lines, so
+.B journalctl -u
+may come back empty right when you need it most \- check
+.B "borg-backup test"
+(it checks free space directly) or
+.B "systemctl status"
+instead, which don't depend on the journal.
 .SH FILES
 .TP
 .I /etc/borg/borg-backup.env

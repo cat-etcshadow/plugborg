@@ -380,7 +380,17 @@ cmd_setup() {
 
     if $EXTERNAL_ENABLED; then
         external_mounted_by_us=false
-        if ! findmnt "$EXTERNAL_MOUNT" >/dev/null 2>&1; then
+        # don't trust a pre-existing mount blindly - if a different drive is
+        # sitting at $EXTERNAL_MOUNT (e.g. switching drives without a clean
+        # unplug in between), initializing against it would silently target
+        # the wrong physical disk
+        mounted_uuid=$(findmnt -no UUID "$EXTERNAL_MOUNT" 2>/dev/null || true)
+        if [ -n "$mounted_uuid" ] && [ "$mounted_uuid" != "$EXTERNAL_FS_UUID" ]; then
+            warn "$EXTERNAL_MOUNT has a different drive mounted (UUID $mounted_uuid, expected $EXTERNAL_FS_UUID) — unmounting it first"
+            run umount "$EXTERNAL_MOUNT"
+            mounted_uuid=""
+        fi
+        if [ -z "$mounted_uuid" ]; then
             run mount "$EXTERNAL_MOUNT" && external_mounted_by_us=true
         fi
         if findmnt "$EXTERNAL_MOUNT" >/dev/null 2>&1 || $DRY_RUN; then
@@ -447,7 +457,7 @@ cmd_status() {
     fi
 
     local failed
-    failed=$(systemctl --failed --no-legend 'borg-*' 2>/dev/null || true)
+    failed=$(systemctl list-units --failed --no-legend 'borg-*' 2>/dev/null || true)
     if [ -n "$failed" ]; then
         warn "failed units:"
         echo "$failed" | sed 's/^/  /'
@@ -565,7 +575,7 @@ cmd_test() {
 
     echo "systemd units:"
     local failed
-    failed=$(systemctl --failed --no-legend 'borg-*' 2>/dev/null || true)
+    failed=$(systemctl list-units --failed --no-legend 'borg-*' 2>/dev/null || true)
     if [ -z "$failed" ]; then
         ok "no failed borg-* units"
     else
@@ -732,7 +742,7 @@ cmd_backup_now() {
 cmd_notify_test() {
     require_env
     [ -n "${NOTIFY_USER:-}" ] || die "NOTIFY_USER is not set in $EXISTING_ENV"
-    /usr/local/sbin/borg-notify.sh "borg-backup" "test notification for $NOTIFY_USER"
+    run /usr/local/sbin/borg-notify.sh "borg-backup" "test notification for $NOTIFY_USER"
     log "sent — if nothing popped up, check notify-send is installed and $NOTIFY_USER is logged into a graphical session"
 }
 
