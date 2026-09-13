@@ -1,0 +1,8 @@
+[Unit]
+Description=TEST — verify external backup drive mounts correctly
+Requires=@MOUNT_UNIT@
+After=@MOUNT_UNIT@
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/borg-external-mount-test.sh

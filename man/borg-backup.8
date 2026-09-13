@@ -1,0 +1,504 @@
+.TH BORG-BACKUP 8 "2026-09-13" "borg-backup" "System Administration Commands"
+.SH NAME
+borg-backup \- setup and day-2 operations for a local + external borg backup system
+.SH SYNOPSIS
+.B borg-backup
+.I command
+.RI [ args ...]
+.RB [ --dry-run ]
+.SH DESCRIPTION
+.B borg-backup
+manages two
+.BR borg (1)
+repokey-encrypted repositories, each driven by root
+.BR systemd (1)
+units:
+.IP \(bu 4
+.B local
+\- an on-disk repo, backed up on a timer
+.IP \(bu 4
+.B external
+\- a USB repo, backed up via a
+.BR udev (7)
+rule on plug-in
+.PP
+All host-specific configuration lives in
+.IR /etc/borg/borg-backup.env ,
+written by
+.B setup
+and sourced by every other command and by the backup/check scripts
+themselves.
+.PP
+Passing
+.B --dry-run
+anywhere on the command line makes every command print what it would run
+or write, instead of running or writing it. No files or devices are
+touched.
+.B setup
+still performs its read-only discovery for real under
+.BR --dry-run ,
+so its prompts show real data (block devices, existing config, etc).
+.SH COMMANDS
+.TP
+.B setup
+Interactive wizard. Asks what to back up, where the local repo lives,
+whether to configure an external drive (lists block devices, requires
+retyping the device path before wiping it), tuning parameters, and a
+passphrase. Writes
+.IR /etc/borg/borg-backup.env ,
+installs the CLI, scripts, and systemd units, optionally partitions and
+formats the external drive, runs
+.B borg init
+on the repositories, and offers to enable the timers. Re-run at any time
+to change settings \- it picks up and re-offers prior answers as defaults.
+.TP
+.B status
+Prints configuration, timer schedule, the last archive in each repo,
+external drive mount/udev-arm state, and any failed
+.I borg-*
+systemd units. Purely a read-only dump of current state \- it does not
+try to decrypt a repo or exercise anything. See
+.B test
+below for an active check.
+.TP
+.BR test " [" --full ]
+Actively verifies the backup system is in a working state, rather than
+just reporting configuration. Checks, in order: the passphrase file's
+presence and permissions; that each configured repo is reachable
+.I and
+that the passphrase actually decrypts it (via
+.BR "borg info" );
+that each repo has at least one archive; that the local backup and
+check timers are enabled and active; that no
+.I borg-*
+systemd unit is in a failed state; that, when
+.B NOTIFY_USER
+is set, notifications are actually wired up (notify-send installed,
+the user exists and has an active session bus); free space on the
+filesystem holding each repo; and, when an external drive is
+configured, whether it is currently attached and mounted and which
+systemd unit the udev rule is currently armed at.
+.IP
+With
+.BR --full ,
+also runs
+.B "borg check"
+against every repo it could reach \- this walks the full repository and
+can take a long time on a large repo, so it is not run by default.
+.IP
+Every failed check is printed together with a reference to the
+TROUBLESHOOTING section below (\(dqsee TROUBLESHOOTING section \fIN\fR\(dq,
+where \fIN\fR is 1\-5) that covers that class of problem, and the exit
+status reflects the overall result (see EXIT STATUS). This makes
+.B test
+suitable both for a human running it interactively and for a monitoring
+job checking the exit code.
+.TP
+.BI "mount-mode " "[managed|normal]"
+With no argument, prints the external drive's current mount mode. With
+.B managed
+or
+.BR normal ,
+switches it: updates the
+.I /etc/fstab
+options, re-renders the udev rule, and updates
+.IR /etc/borg/borg-backup.env .
+See MOUNT MODES below.
+.TP
+.BI "arm-external " "[real|test]"
+Points the external-drive udev rule at real backups
+.RB ( borg-external-backup.service ,
+the default) or back at the mount-only test
+.RB ( borg-external-mount-test.service ).
+See EXTERNAL DRIVE VERIFICATION below.
+.TP
+.BI "backup-now " "[local|external]"
+Starts the corresponding backup service immediately
+.RB ( systemctl " " start ).
+Defaults to
+.BR local .
+.TP
+.BI "check-now " "[local]"
+Starts
+.B borg-check-local.service
+immediately. There is no standalone external check \- it runs
+automatically inside the external backup, throttled by
+.BR CHECK_INTERVAL_DAYS .
+.TP
+.B notify-test
+Sends a test desktop notification to
+.B NOTIFY_USER
+via
+.IR /usr/local/sbin/borg-notify.sh ,
+so you can confirm notifications actually reach the desktop before
+relying on them. Fails if
+.B NOTIFY_USER
+is unset; see TROUBLESHOOTING section 3 if nothing pops up.
+.TP
+.B help
+Prints a short usage summary.
+.SH CONFIGURATION
+Settings live in
+.IR /etc/borg/borg-backup.env ,
+a shell fragment sourced by
+.B borg-backup
+and by the scripts in
+.IR /usr/local/sbin .
+See
+.I config/borg-backup.env.example
+in the source tree for a template with inline comments. The variables
+are:
+.TP
+.B BACKUP_SOURCES
+array of paths to back up.
+.TP
+.B LOCAL_REPO
+path to the local borg repository. Should live outside
+.BR BACKUP_SOURCES ;
+.B setup
+detects and offers to exclude it automatically if not
+.RB ( EXTRA_EXCLUDE_ARGS ).
+.TP
+.B EXTERNAL_MOUNT ", " EXTERNAL_REPO ", " EXTERNAL_FS_UUID
+the external drive's mountpoint, repo path
+.RI ( "$EXTERNAL_MOUNT/borg" ),
+and filesystem UUID (from
+.BR blkid (8)).
+Empty
+.B EXTERNAL_FS_UUID
+means no external drive is configured.
+.TP
+.B MOUNT_MODE
+.B managed
+or
+.BR normal ;
+see MOUNT MODES.
+.TP
+.B ARM_TARGET
+.B borg-external-mount-test.service
+or
+.BR borg-external-backup.service ;
+which one the udev rule wants on insert while
+.B MOUNT_MODE
+is
+.BR managed .
+Set via
+.BR "borg-backup arm-external" ,
+not usually edited by hand. See EXTERNAL DRIVE VERIFICATION.
+.TP
+.B NOTIFY_USER
+desktop username to send
+.BR notify-send (1)
+notifications to on external-drive detection, external backup
+completion, and any
+.I borg-*
+unit failure (local or external). Empty disables notifications
+entirely; requires
+.B notify-send
+installed and
+.B NOTIFY_USER
+logged into a graphical session at the time \- see TROUBLESHOOTING
+section 3.
+.TP
+.B PASSPHRASE_FILE
+path to the borg repo passphrase, mode 600, owned by
+.IR root:root ,
+shared by both repos.
+.TP
+.B COMPRESSION
+passed to
+.B "borg create --compression"
+(e.g.
+.IR zstd,6 ).
+.TP
+.B LOCK_WAIT
+seconds passed to every borg invocation's
+.B --lock-wait
+so overlapping runs wait instead of failing fast; borg has no global
+setting for this.
+.TP
+.B RETENTION
+array of
+.B borg prune
+flags (e.g.
+.IR "--keep-daily 7 --keep-weekly 4 --keep-monthly 6" ).
+.TP
+.B CHECK_INTERVAL_DAYS
+minimum number of days between full
+.B borg check
+runs against the external repo (throttled because it is expensive and
+the drive may be slow or intermittently attached).
+.TP
+.B EXTRA_EXCLUDE_ARGS
+array of extra
+.B borg create --exclude
+arguments.
+.SH MOUNT MODES
+The external drive's
+.B MOUNT_MODE
+controls what happens when it is plugged in:
+.TP
+.B managed
+(default) The udev rule starts the mount unit and the backup/test
+service together; the backup script unmounts the drive again when it
+finishes. The drive is only mounted for the duration of a backup,
+minimizing the window in which a yank or power loss can corrupt the
+filesystem or leave a stale borg lock.
+.TP
+.B normal
+The udev rule starts only the mount unit; the drive mounts like any
+other USB drive on insert and stays mounted until physically unplugged.
+No backup ever runs automatically in this mode \- run
+.B "borg-backup backup-now external"
+by hand while it's plugged in. More convenient (the repo is always
+browsable), at the cost of a wider corruption window if the drive is
+yanked \- see TROUBLESHOOTING section 4.
+.PP
+Switch with
+.BR "borg-backup mount-mode managed" " or " "borg-backup mount-mode normal" ;
+apply immediately by unplugging and replugging the drive, or by
+starting its mount unit directly.
+.PP
+.B ARM_TARGET
+(managed mode only \- see EXTERNAL DRIVE VERIFICATION) has no effect
+while
+.B MOUNT_MODE
+is
+.BR normal ;
+it takes effect again as soon as you switch back to
+.BR managed .
+.SH EXTERNAL DRIVE VERIFICATION
+Because the udev rule fires unattended on plug-in, the external drive
+defaults to being armed at
+.B borg-external-mount-test.service
+\- it touches a marker file and logs to the journal, but never calls
+.BR borg (1).
+Verify the mount and udev wiring first:
+.PP
+.RS
+.EX
+journalctl -u borg-external-mount-test.service -f
+.EE
+.RE
+.PP
+Plug and unplug the drive a few times and confirm one clean run per
+plug, no duplicate or overlapping starts, and (in managed mode) a clean
+unmount. Once satisfied, arm it for real:
+.PP
+.RS
+.EX
+sudo borg-backup arm-external real
+.EE
+.RE
+.SH TROUBLESHOOTING
+.B borg-backup test
+groups problems into five categories; a failed check names the category
+it belongs to as \(dqTROUBLESHOOTING section N\(dq so you can jump straight
+here.
+.SS 1. Passphrase problems
+.I PASSPHRASE_FILE
+(default
+.IR /etc/borg/passphrase )
+must exist, be non-empty, and be mode 600 owned by
+.IR root:root .
+If it is missing, every borg invocation using
+.B BORG_PASSCOMMAND
+fails closed rather than falling back to a prompt (the units run
+unattended, non-interactively). If it was replaced with the wrong
+passphrase, existing repos become unreadable \- restore the exported
+key/passphrase from off-machine storage (see \(dqlost passphrase\(dq
+below).
+Fix: restore the file from backup, or re-run
+.B setup
+to write a fresh one (this does
+.I not
+re-encrypt existing repos with a new key \- it will only be usable if it
+matches what they were created with).
+.SS 2. Repository problems
+Covers a repo that
+.B borg info
+cannot open (wrong or missing passphrase, corrupted repo, path does not
+exist, or another process holds the lock past
+.BR LOCK_WAIT ),
+a repo with zero archives (backups have never succeeded), and, under
+.BR "test --full" ,
+a
+.B borg check
+failure (a structural or data integrity problem in the repository).
+The external repo is the exception for \(dqpath does not exist\(dq: a
+fresh or replaced drive has nothing at
+.I EXTERNAL_REPO
+yet, so
+.B borg-external-backup.sh
+initializes it on the first run after a successful mount (the UUID
+match plus that mount are already the authorization check) and sends a
+notification when it does. Nothing does this for the local repo \-
+.B borg init
+it by hand, or re-run
+.BR setup .
+.PP
+First rule out a stale lock:
+.RS
+.EX
+BORG_REPO=<repo> borg break-lock
+.EE
+.RE
+then re-run
+.B "borg-backup backup-now"
+and watch the journal
+.RI ( "journalctl -u borg-local-backup.service -f" ,
+or
+.IR borg-external-backup.service ).
+A
+.B borg check
+failure may be repairable with
+.B "borg check --repair"
+\- read
+.BR borg-check (1)
+carefully first, it can discard damaged data.
+.SS 3. Timer, systemd unit, and notification problems
+.B borg-local-backup.timer
+and
+.B borg-check-local.timer
+must both be enabled
+.I and
+active; a disabled timer never fires, and an inactive-but-enabled one
+usually means it hasn't run yet since boot or was manually stopped. A
+failed
+.I borg-*
+unit (visible in
+.B "systemctl --failed"
+and reported by both
+.B status
+and
+.BR test )
+means its last run exited non-zero \- read its journal.
+.PP
+.RS
+.EX
+systemctl status borg-local-backup.timer borg-check-local.timer
+journalctl -u borg-local-backup.service -e
+sudo systemctl enable --now borg-local-backup.timer borg-check-local.timer
+.EE
+.RE
+.PP
+Every
+.I borg-*.service
+runs
+.B borg-notify-failure@%n.service
+.RB ( OnFailure= )
+on failure, which best-effort notifies
+.B NOTIFY_USER
+via
+.BR notify-send (1)
+through
+.IR /usr/local/sbin/borg-notify.sh .
+Notification delivery is never itself a cause of backup failure \-
+.I borg-notify.sh
+exits 0 and does nothing if
+.B NOTIFY_USER
+is unset, if
+.B notify-send
+is not installed, or if that user has no active
+.RI ( /run/user/<uid>/bus )
+graphical session at the moment. Test the path independently of a real
+failure with
+.BR "borg-backup notify-test" ;
+.B borg-backup test
+also checks that the prerequisites are in place.
+.SS 4. External drive problems
+Covers: no device with the configured
+.B EXTERNAL_FS_UUID
+currently attached (expected whenever the drive is unplugged \- not
+itself a failure, just untestable right now); the drive attached but
+not mounted outside of a backup window (expected in
+.B managed
+mode between runs); and the udev rule still armed at
+.B borg-external-mount-test.service
+instead of
+.B borg-external-backup.service
+(meaning plugging the drive in does not actually run backups yet).
+.PP
+See EXTERNAL DRIVE VERIFICATION above for the test/arm flow, and MOUNT
+MODES above for
+.BR managed / normal .
+A device that never shows up when plugged in suggests the
+.I /etc/udev/rules.d/90-borg-external.rules
+UUID no longer matches the drive (it was reformatted, or this is a
+different drive) \- re-run
+.B setup
+or edit
+.B EXTERNAL_FS_UUID
+by hand and reinstall the rule with
+.BR "borg-backup mount-mode" .
+.SS 5. Disk space problems
+The filesystem holding a repo running low on free space will eventually
+fail
+.B borg create
+or
+.B borg compact
+mid-run, which can leave an incomplete archive (caught later by
+.BR "borg check" ,
+not prevented). Free space ahead of time with
+.BR "borg prune" " and " "borg compact" ,
+tighten
+.BR RETENTION ,
+or move the repo to larger storage.
+.SH FILES
+.TP
+.I /etc/borg/borg-backup.env
+host-specific configuration, written by
+.BR setup .
+.TP
+.I /etc/borg/passphrase
+the shared repo passphrase, mode 600 root:root.
+.TP
+.I /usr/local/sbin/borg-backup ", " /usr/local/sbin/borg-*-backup.sh ", " /usr/local/sbin/borg-check-local.sh ", " /usr/local/sbin/borg-notify.sh
+the installed CLI, backup/check scripts, and the desktop-notification
+helper.
+.TP
+.I /etc/systemd/system/borg-*.service ", " /etc/systemd/system/borg-*.timer
+installed systemd units, including
+.I borg-external-detected.service
+(notifies on drive plug-in, wanted by the udev rule alongside the
+backup/test target) and the templated
+.IR borg-notify-failure@.service .
+.TP
+.I /etc/udev/rules.d/90-borg-external.rules
+udev rule matching the external drive by filesystem UUID; its
+.B SYSTEMD_WANTS
+always includes
+.I borg-external-detected.service
+plus the backup/test target (and the mount unit too, in
+.B normal
+mode).
+.TP
+.I /usr/local/share/man/man8/borg-backup.8
+this man page, installed by
+.BR setup .
+.SH EXIT STATUS
+.TP
+.B 0
+success (for
+.BR test :
+every check passed).
+.TP
+.B 1
+failure \- for most commands, a usage or precondition error (see the
+message); for
+.BR test ,
+one or more checks failed. Run without
+.B --full
+first; the message names the affected TROUBLESHOOTING section.
+.SH SEE ALSO
+.BR borg (1),
+.BR borg-check (1),
+.BR systemctl (1),
+.BR journalctl (1),
+.BR udev (7),
+.BR blkid (8),
+.BR fstab (5)
+.PP
+.I README.md
+in the source tree covers installation and the manual (non-wizard)
+setup path.

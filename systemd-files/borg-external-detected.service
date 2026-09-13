@@ -1,0 +1,6 @@
+[Unit]
+Description=Notify: external backup drive detected
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/borg-external-detected.sh

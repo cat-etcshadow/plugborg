@@ -1,0 +1,6 @@
+[Unit]
+Description=Notify: %i failed
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/borg-notify.sh "borg backup failed" "%i - journalctl -u %i"

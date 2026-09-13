@@ -1,0 +1,9 @@
+[Unit]
+Description=Borg integrity check - local repository
+OnFailure=borg-notify-failure@%n.service
+
+[Service]
+Type=oneshot
+Nice=19
+IOSchedulingClass=idle
+ExecStart=/usr/local/sbin/borg-check-local.sh

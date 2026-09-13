@@ -1,0 +1,780 @@
+#!/bin/bash
+# borg-backup CLI: setup + day-2 operations. see: borg-backup help
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+EXISTING_ENV=/etc/borg/borg-backup.env
+DRY_RUN=false
+
+usage() {
+    cat <<'EOF'
+usage: borg-backup <command> [args...] [--dry-run]
+
+commands:
+  setup                          interactive wizard: local + optional external backup setup
+  status                         config, timers, last archives, external mount/arm state
+  test [--full]                  actively verify the backup system works, exit 0/1
+                                  (--full also runs borg check on reachable repos)
+  mount-mode [managed|normal]    show, or switch, the external drive's mount behavior
+  arm-external [real|test]       point the external-drive udev rule at real backups
+                                  (default: real) or back at the mount-only test
+  backup-now [local|external]    trigger a backup immediately (default: local)
+  check-now [local]              trigger an integrity check immediately
+  notify-test                    send a test desktop notification to NOTIFY_USER
+  help                           show this message
+
+--dry-run   print every command instead of running it; no files or devices
+            are touched. setup's read-only discovery still runs for real
+            so its prompts show real data.
+EOF
+}
+
+log()  { echo ">> $*"; }
+warn() { echo "!! $*" >&2; }
+die()  { echo "error: $*" >&2; exit 1; }
+
+require_root() {
+    $DRY_RUN && return 0
+    [ "$(id -u)" -eq 0 ] || die "must be run as root (or pass --dry-run)"
+}
+
+require_env() {
+    [ -f "$EXISTING_ENV" ] || die "no $EXISTING_ENV found — run: borg-backup setup"
+    source "$EXISTING_ENV"
+}
+
+require_external() {
+    [ -n "${EXTERNAL_FS_UUID:-}" ] || die "no external drive configured — run: borg-backup setup"
+}
+
+# run <cmd...> - executes, or under --dry-run just prints what would run
+run() {
+    if $DRY_RUN; then
+        printf '[dry-run]'
+        printf ' %q' "$@"
+        echo
+    else
+        "$@"
+    fi
+}
+
+# write_file <path> <mode> <owner:group> <<< content - writes, or prints under --dry-run
+write_file() {
+    local path="$1" mode="$2" owner="$3"
+    if $DRY_RUN; then
+        echo "[dry-run] write $path (mode $mode, owner $owner):"
+        sed 's/^/    /'
+    else
+        install -m "$mode" -o "${owner%%:*}" -g "${owner##*:}" /dev/null "$path"
+        cat > "$path"
+    fi
+}
+
+ask() {
+    local prompt="$1" default="${2:-}" reply
+    read -rp "$prompt${default:+ [$default]}: " reply </dev/tty
+    echo "${reply:-$default}"
+}
+
+confirm() {
+    local prompt="$1" default="${2:-n}" reply
+    read -rp "$prompt [$([ "$default" = y ] && echo Y/n || echo y/N)]: " reply </dev/tty
+    reply="${reply:-$default}"
+    [[ "$reply" =~ ^[Yy]$ ]]
+}
+
+# fstab_opts_for_mode <managed|normal>
+fstab_opts_for_mode() {
+    if [ "$1" = normal ]; then
+        echo "noauto,noatime,x-systemd.automount,x-systemd.device-timeout=10,nofail"
+    else
+        echo "noauto,noatime,x-systemd.device-timeout=10"
+    fi
+}
+
+# systemd_wants_for_mode <managed|normal> <mount_unit> <target_service>
+# normal mode mounts like a plain USB drive and stops there - no auto-backup
+# on insert, since the whole point is browsing without triggering a run;
+# the target only fires automatically in managed mode (see arm-external)
+systemd_wants_for_mode() {
+    if [ "$1" = normal ]; then
+        echo "$2 borg-external-detected.service"
+    else
+        echo "borg-external-detected.service $3"
+    fi
+}
+
+# render_udev_rule <systemd_wants_value> - needs $EXTERNAL_FS_UUID in scope
+render_udev_rule() {
+    local content
+    content=$(<"$SCRIPT_DIR/udev/90-borg-external.rules.tmpl")
+    content="${content//@EXTERNAL_FS_UUID@/$EXTERNAL_FS_UUID}"
+    content="${content//@SYSTEMD_WANTS@/$1}"
+    printf '%s\n' "$content"
+}
+
+# current_udev_target - which service is armed (test or real backup); needs
+# $ARM_TARGET in scope (from the env file) - normal mode's udev rule doesn't
+# mention the target at all, so it can't be read back from the rule text
+current_udev_target() {
+    echo "${ARM_TARGET:-borg-external-mount-test.service}"
+}
+
+# write_udev_rule <mode> <target_service> - renders, installs, reloads the udev rule (needs $EXTERNAL_MOUNT/$EXTERNAL_FS_UUID)
+write_udev_rule() {
+    local mode="$1" target="$2" mount_unit wants
+    mount_unit=$(systemd-escape --path --suffix=mount "$EXTERNAL_MOUNT")
+    wants=$(systemd_wants_for_mode "$mode" "$mount_unit" "$target")
+    local rules_file=/etc/udev/rules.d/90-borg-external.rules
+    if $DRY_RUN; then
+        echo "[dry-run] write $rules_file:"
+        render_udev_rule "$wants" | sed 's/^/    /'
+    else
+        render_udev_rule "$wants" > "$rules_file"
+    fi
+    run udevadm control --reload-rules
+}
+
+cmd_setup() {
+    command -v borg >/dev/null 2>&1 || die "borg is not installed"
+    require_root
+
+    echo "borg-backup setup$($DRY_RUN && echo ' (dry run — nothing will be changed)')"
+    echo
+
+    [ -f "$EXISTING_ENV" ] && source "$EXISTING_ENV"
+
+    # --- sources ---
+    read -ra BACKUP_SOURCES <<< "$(ask "paths to back up, space separated" "${BACKUP_SOURCES[*]:-$HOME}")"
+    for src in "${BACKUP_SOURCES[@]}"; do
+        [ -d "$src" ] || warn "$src does not exist (yet) — continuing anyway"
+    done
+
+    # --- local repo ---
+    LOCAL_REPO=$(ask "local repo path" "${LOCAL_REPO:-/var/backups/borg}")
+    EXTRA_EXCLUDE_ARGS=(${EXTRA_EXCLUDE_ARGS[@]+"${EXTRA_EXCLUDE_ARGS[@]}"})
+    for src in "${BACKUP_SOURCES[@]}"; do
+        case "$LOCAL_REPO" in
+            "$src"|"$src"/*)
+                warn "$LOCAL_REPO is inside backup source $src — it would back up itself"
+                if confirm "add an --exclude for it automatically?" y; then
+                    EXTRA_EXCLUDE_ARGS=(--exclude "$LOCAL_REPO")
+                fi
+                ;;
+        esac
+    done
+
+    # --- tuning ---
+    COMPRESSION=$(ask "compression" "${COMPRESSION:-zstd,6}")
+    LOCK_WAIT=$(ask "lock-wait seconds (avoids failing fast on overlapping runs)" "${LOCK_WAIT:-300}")
+    CHECK_INTERVAL_DAYS=$(ask "full integrity check interval, in days" "${CHECK_INTERVAL_DAYS:-30}")
+    read -ra RETENTION <<< "$(ask "retention (borg prune flags)" "${RETENTION[*]:---keep-daily 7 --keep-weekly 4 --keep-monthly 6}")"
+
+    # --- notifications ---
+    NOTIFY_USER=$(ask "desktop username for notify-send on drive detect/backup done/failure (blank to disable)" "${NOTIFY_USER:-${SUDO_USER:-}}")
+
+    # --- external drive ---
+    EXTERNAL_ENABLED=false
+    EXTERNAL_MOUNT="${EXTERNAL_MOUNT:-/mnt/borg-external}"
+    EXTERNAL_FS_UUID="${EXTERNAL_FS_UUID:-}"
+    PREV_EXTERNAL_FS_UUID="$EXTERNAL_FS_UUID"
+    MOUNT_MODE="${MOUNT_MODE:-managed}"
+    if confirm "set up an external (USB) drive backup too?"; then
+        EXTERNAL_ENABLED=true
+        echo
+        echo "mount mode controls what happens to the drive once it's plugged in:"
+        echo "  managed - mounted only while a backup runs, then unmounted"
+        echo "  normal  - mounts like a regular USB drive on insert, stays mounted"
+        if confirm "use 'normal' mount mode instead of 'managed'?" $([ "$MOUNT_MODE" = normal ] && echo y || echo n); then
+            MOUNT_MODE=normal
+        else
+            MOUNT_MODE=managed
+        fi
+
+        ARM_TARGET=borg-external-mount-test.service
+        if [ "$MOUNT_MODE" = managed ]; then
+            confirm "wire the udev rule straight to real backups now (skip the mount-only test)?" n \
+                && ARM_TARGET=borg-external-backup.service
+        else
+            log "normal mode never auto-backs-up on insert; use 'borg-backup arm-external' after switching to managed if you want that later"
+        fi
+        echo
+        lsblk -o NAME,SIZE,MODEL,TRAN,HOTPLUG
+        echo
+        EXTERNAL_DEVICE=$(ask "device to use, e.g. /dev/sdb (whole disk, not a partition)" "")
+        [ -n "$EXTERNAL_DEVICE" ] || die "no device given"
+        if ! $DRY_RUN && [ ! -b "$EXTERNAL_DEVICE" ]; then
+            die "$EXTERNAL_DEVICE is not a block device"
+        fi
+        EXTERNAL_MOUNT=$(ask "mountpoint for the external repo" "$EXTERNAL_MOUNT")
+        EXTERNAL_REPO="$EXTERNAL_MOUNT/borg"
+
+        # nvme/loop/mmcblk devices end in a digit and need a "p" before the partition number
+        if [[ "$EXTERNAL_DEVICE" =~ [0-9]$ ]]; then
+            EXTERNAL_PARTITION="${EXTERNAL_DEVICE}p1"
+        else
+            EXTERNAL_PARTITION="${EXTERNAL_DEVICE}1"
+        fi
+
+        if confirm "partition + format $EXTERNAL_DEVICE now? (say no if it's already set up)" y; then
+            echo
+            warn "this ERASES ALL DATA on $EXTERNAL_DEVICE"
+            lsblk "$EXTERNAL_DEVICE" -o NAME,SIZE,FSTYPE,LABEL 2>/dev/null || true
+            typed=$(ask "type the device path again to confirm the wipe" "")
+            [ "$typed" = "$EXTERNAL_DEVICE" ] || die "confirmation did not match, aborting"
+
+            run umount "$EXTERNAL_PARTITION" 2>/dev/null || true
+            run wipefs -a "$EXTERNAL_PARTITION" 2>/dev/null || true
+            run wipefs -a "$EXTERNAL_DEVICE"
+            run parted -a optimal "$EXTERNAL_DEVICE" -- mklabel gpt
+            run parted -a optimal "$EXTERNAL_DEVICE" -- mkpart primary ext4 0% 100%
+            run udevadm settle
+            run partprobe "$EXTERNAL_DEVICE"
+            run udevadm settle
+            # mkpart doesn't erase old fs data, so a leftover signature could get auto-mounted here
+            run umount "$EXTERNAL_PARTITION" 2>/dev/null || true
+            run wipefs -a "$EXTERNAL_PARTITION"
+            run mkfs.ext4 -L borgbackup -m 1 "$EXTERNAL_PARTITION"
+
+            if $DRY_RUN; then
+                EXTERNAL_FS_UUID="<uuid-known-after-mkfs>"
+            else
+                EXTERNAL_FS_UUID=$(blkid -s UUID -o value "$EXTERNAL_PARTITION")
+            fi
+            log "external drive UUID: $EXTERNAL_FS_UUID"
+        else
+            EXTERNAL_FS_UUID=$(ask "filesystem UUID of the already-partitioned drive (from: blkid -s UUID -o value $EXTERNAL_PARTITION)" "$EXTERNAL_FS_UUID")
+        fi
+
+        # switching to a different device (re-running setup) - drop the old
+        # UUID's fstab line rather than leaving it behind as orphaned clutter
+        if [ -n "$PREV_EXTERNAL_FS_UUID" ] && [ "$PREV_EXTERNAL_FS_UUID" != "$EXTERNAL_FS_UUID" ] \
+            && grep -qE "^UUID=$PREV_EXTERNAL_FS_UUID[[:space:]]" /etc/fstab 2>/dev/null; then
+            if $DRY_RUN; then
+                echo "[dry-run] remove /etc/fstab entry for old UUID=$PREV_EXTERNAL_FS_UUID"
+            else
+                sed -i "\#^UUID=$PREV_EXTERNAL_FS_UUID[[:space:]]#d" /etc/fstab
+            fi
+        fi
+
+        # required either way: the external services Require= the fstab-generated .mount unit
+        run mkdir -p "$EXTERNAL_MOUNT"
+        if ! grep -qE "^UUID=$EXTERNAL_FS_UUID[[:space:]]" /etc/fstab 2>/dev/null; then
+            fstab_line="UUID=$EXTERNAL_FS_UUID $EXTERNAL_MOUNT ext4 $(fstab_opts_for_mode "$MOUNT_MODE") 0 2"
+            if $DRY_RUN; then
+                echo "[dry-run] append to /etc/fstab: $fstab_line"
+            else
+                echo "$fstab_line" >> /etc/fstab
+            fi
+        fi
+        run systemctl daemon-reload
+    elif [ -n "$EXTERNAL_FS_UUID" ]; then
+        log "keeping existing external drive config as-is (UUID $EXTERNAL_FS_UUID) — edit $EXISTING_ENV by hand, or answer yes here, to change it"
+    fi
+
+    # --- passphrase ---
+    PASSPHRASE_FILE="${PASSPHRASE_FILE:-/etc/borg/passphrase}"
+    NEED_PASSPHRASE=true
+    if [ -s "$PASSPHRASE_FILE" ]; then
+        log "passphrase file already exists: $PASSPHRASE_FILE"
+        confirm "replace it? (breaks access to repos still using the old one)" n || NEED_PASSPHRASE=false
+    fi
+    if $NEED_PASSPHRASE; then
+        if confirm "generate a random passphrase?" y; then
+            PASSPHRASE=$(openssl rand -base64 32 2>/dev/null || head -c 32 /dev/urandom | base64)
+        else
+            read -rsp "passphrase: " PASSPHRASE </dev/tty; echo
+        fi
+        run mkdir -p "$(dirname "$PASSPHRASE_FILE")"
+        if $DRY_RUN; then
+            echo "[dry-run] write $PASSPHRASE_FILE (mode 600, owner root:root) — value not shown"
+        else
+            printf '%s\n' "$PASSPHRASE" | write_file "$PASSPHRASE_FILE" 600 root:root
+        fi
+    else
+        log "keeping existing $PASSPHRASE_FILE"
+    fi
+
+    # --- write config ---
+    {
+        echo "BACKUP_SOURCES=(${BACKUP_SOURCES[@]@Q})"
+        echo "LOCAL_REPO=${LOCAL_REPO@Q}"
+        echo "EXTERNAL_MOUNT=${EXTERNAL_MOUNT@Q}"
+        echo 'EXTERNAL_REPO="$EXTERNAL_MOUNT/borg"'
+        echo "EXTERNAL_FS_UUID=${EXTERNAL_FS_UUID@Q}"
+        echo "MOUNT_MODE=${MOUNT_MODE@Q}"
+        arm_target_out="${ARM_TARGET:-borg-external-mount-test.service}"
+        echo "ARM_TARGET=${arm_target_out@Q}"
+        echo "NOTIFY_USER=${NOTIFY_USER@Q}"
+        echo "PASSPHRASE_FILE=${PASSPHRASE_FILE@Q}"
+        echo "COMPRESSION=${COMPRESSION@Q}"
+        echo "LOCK_WAIT=${LOCK_WAIT@Q}"
+        echo "RETENTION=(${RETENTION[@]@Q})"
+        echo "CHECK_INTERVAL_DAYS=${CHECK_INTERVAL_DAYS@Q}"
+        echo "EXTRA_EXCLUDE_ARGS=(${EXTRA_EXCLUDE_ARGS[@]@Q})"
+    } | write_file /etc/borg/borg-backup.env 644 root:root
+
+    # --- install scripts + units ---
+    # mirror the source tree into a stable location so re-running setup (or
+    # day-2 commands like mount-mode/arm-external) via the installed CLI can
+    # still find the scripts/units/templates/man page without the checkout
+    local lib_dir=/usr/local/lib/borg-backup
+    if [ "$SCRIPT_DIR" != "$lib_dir" ]; then
+        run install -d -m 755 -o root -g root "$lib_dir"/bin "$lib_dir"/scripts "$lib_dir"/systemd-files "$lib_dir"/udev "$lib_dir"/man
+        run install -m 700 -o root -g root "$SCRIPT_DIR"/scripts/*.sh "$lib_dir"/scripts/
+        run install -m 644 -o root -g root "$SCRIPT_DIR"/systemd-files/* "$lib_dir"/systemd-files/
+        run install -m 644 -o root -g root "$SCRIPT_DIR"/udev/*.tmpl "$lib_dir"/udev/
+        run install -m 644 -o root -g root "$SCRIPT_DIR/man/borg-backup.8" "$lib_dir"/man/
+        run install -m 700 -o root -g root "$SCRIPT_DIR/bin/borg-backup" "$lib_dir"/bin/
+    fi
+
+    for f in "$SCRIPT_DIR"/scripts/*.sh; do
+        run install -m 700 -o root -g root "$f" "/usr/local/sbin/$(basename "$f")"
+    done
+    run ln -sf "$lib_dir/bin/borg-backup" /usr/local/sbin/borg-backup
+    run install -m 644 -o root -g root "$SCRIPT_DIR"/systemd-files/*.service "$SCRIPT_DIR"/systemd-files/*.timer /etc/systemd/system/
+    run install -d -m 755 /usr/local/share/man/man8
+    run install -m 644 -o root -g root "$SCRIPT_DIR/man/borg-backup.8" /usr/local/share/man/man8/borg-backup.8
+    if command -v mandb >/dev/null 2>&1; then
+        run mandb -q || true
+    fi
+    log "installed scripts, CLI, local systemd units, and the man page (man borg-backup)"
+
+    if $EXTERNAL_ENABLED; then
+        # templated because the mount unit name is derived from EXTERNAL_MOUNT
+        MOUNT_UNIT=$(systemd-escape --path --suffix=mount "$EXTERNAL_MOUNT")
+        target="$ARM_TARGET"
+
+        for tmpl in "$SCRIPT_DIR"/systemd-files/*.service.tmpl; do
+            out="/etc/systemd/system/$(basename "${tmpl%.tmpl}")"
+            local content
+            content=$(<"$tmpl")
+            content="${content//@MOUNT_UNIT@/$MOUNT_UNIT}"
+            if $DRY_RUN; then
+                echo "[dry-run] write $out:"
+                printf '%s\n' "$content" | sed 's/^/    /'
+            else
+                printf '%s\n' "$content" > "$out"
+            fi
+        done
+        log "installed external systemd units (mount unit: $MOUNT_UNIT)"
+
+        write_udev_rule "$MOUNT_MODE" "$target"
+        log "udev rule installed, targeting $target (mount mode: $MOUNT_MODE)"
+    fi
+
+    run systemctl daemon-reload
+
+    # --- init repos ---
+    if confirm "run 'borg init' on the local repo now?" y; then
+        local_repo_parent="$(dirname "$LOCAL_REPO")"
+        if [ ! -d "$local_repo_parent" ]; then
+            run mkdir -p "$local_repo_parent"
+            run chown root:root "$local_repo_parent"  # only ever a dir we just created, never a pre-existing one like /
+            run chmod 700 "$local_repo_parent"
+        fi
+        BORG_REPO="$LOCAL_REPO" BORG_PASSCOMMAND="cat '$PASSPHRASE_FILE'" \
+            run borg init --encryption=repokey --make-parent-dirs "$LOCAL_REPO"
+        warn "export and store the repo key off this machine: borg key export $LOCAL_REPO <path>"
+    fi
+
+    if $EXTERNAL_ENABLED; then
+        external_mounted_by_us=false
+        if ! findmnt "$EXTERNAL_MOUNT" >/dev/null 2>&1; then
+            run mount "$EXTERNAL_MOUNT" && external_mounted_by_us=true
+        fi
+        if findmnt "$EXTERNAL_MOUNT" >/dev/null 2>&1 || $DRY_RUN; then
+            if confirm "run 'borg init' on the external repo now?" y; then
+                run mkdir -p "$EXTERNAL_REPO"
+                BORG_REPO="$EXTERNAL_REPO" BORG_PASSCOMMAND="cat '$PASSPHRASE_FILE'" \
+                    run borg init --encryption=repokey --make-parent-dirs "$EXTERNAL_REPO"
+                warn "export and store the repo key off this machine: borg key export $EXTERNAL_REPO <path>"
+            fi
+        else
+            warn "could not mount $EXTERNAL_MOUNT — init it manually before the first backup:" \
+                 "BORG_REPO=$EXTERNAL_REPO BORG_PASSCOMMAND='cat $PASSPHRASE_FILE' borg init --encryption=repokey --make-parent-dirs $EXTERNAL_REPO"
+        fi
+        $external_mounted_by_us && run umount "$EXTERNAL_MOUNT"
+    fi
+
+    # --- timers ---
+    if confirm "enable the local backup + check timers now?" y; then
+        run systemctl enable --now borg-local-backup.timer borg-check-local.timer
+    fi
+
+    echo
+    log "done. run 'borg-backup status' any time. see README.md for the external drive verify/arm flow."
+}
+
+cmd_status() {
+    require_env
+    echo "config: $EXISTING_ENV"
+    echo "  backup sources:  ${BACKUP_SOURCES[*]}"
+    echo "  local repo:      $LOCAL_REPO"
+    if [ -n "${EXTERNAL_FS_UUID:-}" ]; then
+        echo "  external repo:   $EXTERNAL_REPO (mount: $EXTERNAL_MOUNT, mode: ${MOUNT_MODE:-managed})"
+    else
+        echo "  external repo:   not configured"
+    fi
+    echo
+
+    echo "timers:"
+    systemctl list-timers 'borg-*' --no-legend 2>/dev/null | sed 's/^/  /' || true
+    echo
+
+    echo "local repo, last archive:"
+    BORG_REPO="$LOCAL_REPO" BORG_PASSCOMMAND="cat '$PASSPHRASE_FILE'" \
+        borg list --last 1 --short "$LOCAL_REPO" 2>/dev/null | sed 's/^/  /' \
+        || echo "  unavailable (missing, locked, or unreadable passphrase file)"
+    echo
+
+    if [ -n "${EXTERNAL_FS_UUID:-}" ]; then
+        echo "external drive:"
+        if findmnt "$EXTERNAL_MOUNT" >/dev/null 2>&1; then
+            echo "  mounted at $EXTERNAL_MOUNT"
+            BORG_REPO="$EXTERNAL_REPO" BORG_PASSCOMMAND="cat '$PASSPHRASE_FILE'" \
+                borg list --last 1 --short "$EXTERNAL_REPO" 2>/dev/null | sed 's/^/  last archive: /' \
+                || echo "  last archive: unavailable"
+        else
+            echo "  not mounted"
+        fi
+        if [ "${MOUNT_MODE:-managed}" = normal ]; then
+            echo "  udev target: $(current_udev_target) (inactive - normal mode never auto-backs-up)"
+        else
+            echo "  udev target: $(current_udev_target)"
+        fi
+        echo
+    fi
+
+    local failed
+    failed=$(systemctl --failed --no-legend 'borg-*' 2>/dev/null || true)
+    if [ -n "$failed" ]; then
+        warn "failed units:"
+        echo "$failed" | sed 's/^/  /'
+    else
+        log "no failed borg units"
+    fi
+}
+
+cmd_test() {
+    require_env
+    require_root
+
+    local full=false a
+    for a in "$@"; do
+        case "$a" in
+            --full) full=true ;;
+            *) die "usage: borg-backup test [--full]" ;;
+        esac
+    done
+
+    local failures=0
+    ok()   { echo "  [ok]   $*"; }
+    note() { echo "  [--]   $*"; }
+    fail() {
+        echo "  [FAIL] $1" >&2
+        [ -n "${2:-}" ] && echo "         see: man borg-backup, TROUBLESHOOTING section $2" >&2
+        failures=$((failures + 1))
+    }
+
+    check_space() {
+        local label="$1" path="$2" line pct avail
+        if [ ! -e "$path" ]; then
+            note "$label filesystem check skipped - $path does not exist yet"
+            return 0
+        fi
+        line=$(df -Pk "$path" 2>/dev/null | tail -1) || { note "$label filesystem check skipped - df failed on $path"; return 0; }
+        pct=$(awk '{print $5}' <<< "$line" | tr -d '%')
+        avail=$(awk '{print int($4/1024)}' <<< "$line")
+        if [ -n "$pct" ] && [ "$pct" -ge 90 ] 2>/dev/null; then
+            fail "$label filesystem is ${pct}% full (${avail}M free)" 5
+        else
+            ok "$label filesystem ${pct:-?}% full (${avail:-?}M free)"
+        fi
+    }
+
+    test_repo() {
+        local label="$1" repo="$2" out last
+        echo "$label repo: $repo"
+        if out=$(BORG_REPO="$repo" BORG_PASSCOMMAND="cat '$PASSPHRASE_FILE'" borg info --lock-wait 10 "$repo" 2>&1); then
+            ok "reachable, passphrase decrypts it"
+            last=$(BORG_REPO="$repo" BORG_PASSCOMMAND="cat '$PASSPHRASE_FILE'" borg list --last 1 --short "$repo" 2>/dev/null || true)
+            if [ -n "$last" ]; then
+                ok "last archive: $last"
+            else
+                fail "$label repo has no archives — backups have never succeeded here" 2
+            fi
+            if $full; then
+                if out=$(BORG_REPO="$repo" BORG_PASSCOMMAND="cat '$PASSPHRASE_FILE'" borg check --lock-wait "$LOCK_WAIT" "$repo" 2>&1); then
+                    ok "borg check passed"
+                else
+                    fail "borg check failed on $label repo" 2
+                    echo "$out" | sed 's/^/         /' >&2
+                fi
+            fi
+        else
+            fail "$label repo unreachable, or the passphrase does not decrypt it" 2
+            echo "$out" | sed 's/^/         /' >&2
+        fi
+        echo
+    }
+
+    echo "borg-backup test$($full && echo ' --full (running borg check — this can take a while)')"
+    echo
+
+    echo "prerequisites:"
+    if command -v borg >/dev/null 2>&1; then
+        ok "borg installed ($(borg --version 2>&1))"
+    else
+        fail "borg is not installed" 2
+    fi
+    echo
+
+    echo "passphrase:"
+    if [ -s "$PASSPHRASE_FILE" ]; then
+        local perms
+        perms=$(stat -c '%a %U:%G' "$PASSPHRASE_FILE" 2>/dev/null || echo "?")
+        if [ "$perms" = "600 root:root" ]; then
+            ok "$PASSPHRASE_FILE ($perms)"
+        else
+            fail "$PASSPHRASE_FILE has unexpected permissions: $perms (want 600 root:root)" 1
+        fi
+    else
+        fail "$PASSPHRASE_FILE is missing or empty" 1
+    fi
+    echo
+
+    test_repo local "$LOCAL_REPO"
+    check_space "local repo" "$(dirname "$LOCAL_REPO")"
+    echo
+
+    echo "timers:"
+    local t state active
+    for t in borg-local-backup.timer borg-check-local.timer; do
+        state=$(systemctl is-enabled "$t" 2>/dev/null) || true
+        active=$(systemctl is-active "$t" 2>/dev/null) || true
+        state="${state:-disabled}"
+        active="${active:-inactive}"
+        if [ "$state" = enabled ] && [ "$active" = active ]; then
+            ok "$t: enabled, active"
+        else
+            fail "$t: $state, $active (want: enabled, active)" 3
+        fi
+    done
+    echo
+
+    echo "systemd units:"
+    local failed
+    failed=$(systemctl --failed --no-legend 'borg-*' 2>/dev/null || true)
+    if [ -z "$failed" ]; then
+        ok "no failed borg-* units"
+    else
+        fail "failed borg-* units" 3
+        echo "$failed" | sed 's/^/         /' >&2
+    fi
+    echo
+
+    if [ -n "${NOTIFY_USER:-}" ]; then
+        echo "notifications:"
+        if command -v notify-send >/dev/null 2>&1; then
+            ok "notify-send installed"
+        else
+            fail "NOTIFY_USER is set but notify-send is not installed" 3
+        fi
+        local uid
+        if uid=$(id -u "$NOTIFY_USER" 2>/dev/null); then
+            if [ -S "/run/user/$uid/bus" ]; then
+                ok "$NOTIFY_USER has an active session bus — notifications will show"
+            else
+                note "$NOTIFY_USER has no active session bus right now — notifications are silently skipped until a graphical login"
+            fi
+        else
+            fail "NOTIFY_USER=$NOTIFY_USER does not exist" 3
+        fi
+        echo
+    fi
+
+    if [ -n "${EXTERNAL_FS_UUID:-}" ]; then
+        echo "external drive:"
+        if blkid -U "$EXTERNAL_FS_UUID" >/dev/null 2>&1; then
+            ok "device with UUID $EXTERNAL_FS_UUID is attached"
+            if findmnt "$EXTERNAL_MOUNT" >/dev/null 2>&1; then
+                ok "mounted at $EXTERNAL_MOUNT"
+                echo
+                test_repo external "$EXTERNAL_REPO"
+                check_space "external repo" "$EXTERNAL_MOUNT"
+            else
+                note "not currently mounted — expected between backups in managed mode (see TROUBLESHOOTING section 4)"
+            fi
+        else
+            note "no device with UUID $EXTERNAL_FS_UUID attached — plug it in to test further (see TROUBLESHOOTING section 4)"
+        fi
+
+        local target
+        target=$(current_udev_target)
+        if [ "${MOUNT_MODE:-managed}" = normal ]; then
+            note "mount mode is 'normal' — insert never auto-backs-up regardless of arm state ($target); see MOUNT MODES in man page"
+        elif [ "$target" = borg-external-mount-test.service ]; then
+            note "udev is armed at TEST only, not real backups — run: borg-backup arm-external real (see TROUBLESHOOTING section 4)"
+        else
+            ok "udev armed at real backups ($target)"
+        fi
+        echo
+    else
+        note "external drive not configured"
+        echo
+    fi
+
+    echo "---"
+    if [ "$failures" -eq 0 ]; then
+        log "all checks passed"
+    else
+        warn "$failures check(s) failed — each is annotated above with the TROUBLESHOOTING section that covers it; run: man borg-backup"
+    fi
+    return $((failures > 0 ? 1 : 0))
+}
+
+cmd_mount_mode() {
+    require_env
+    if [ $# -eq 0 ]; then
+        require_external
+        log "current mount mode: ${MOUNT_MODE:-managed}"
+        return
+    fi
+
+    local mode="$1"
+    case "$mode" in
+        managed|normal) ;;
+        *) die "usage: borg-backup mount-mode [managed|normal]" ;;
+    esac
+    require_external
+    require_root
+
+    local target
+    target=$(current_udev_target)
+    local fstab_opts
+    fstab_opts=$(fstab_opts_for_mode "$mode")
+
+    log "switching external drive mount mode: ${MOUNT_MODE:-managed} -> $mode"
+
+    if grep -qE "^UUID=$EXTERNAL_FS_UUID[[:space:]]" /etc/fstab; then
+        if $DRY_RUN; then
+            echo "[dry-run] update /etc/fstab options for UUID=$EXTERNAL_FS_UUID to: $fstab_opts"
+        else
+            sed -i -E "s#^(UUID=$EXTERNAL_FS_UUID[[:space:]]+\S+[[:space:]]+\S+)[[:space:]]+\S+#\1 $fstab_opts#" /etc/fstab
+        fi
+    else
+        warn "no /etc/fstab entry for UUID=$EXTERNAL_FS_UUID found — add one manually"
+    fi
+
+    write_udev_rule "$mode" "$target"
+
+    if grep -q '^MOUNT_MODE=' "$EXISTING_ENV"; then
+        run sed -i "s/^MOUNT_MODE=.*/MOUNT_MODE=$mode/" "$EXISTING_ENV"
+    elif $DRY_RUN; then
+        echo "[dry-run] append MOUNT_MODE=$mode to $EXISTING_ENV"
+    else
+        echo "MOUNT_MODE=$mode" >> "$EXISTING_ENV"
+    fi
+
+    run systemctl daemon-reload
+
+    local mount_unit
+    mount_unit=$(systemd-escape --path --suffix=mount "$EXTERNAL_MOUNT")
+    echo
+    log "mount mode set to '$mode'. unplug/replug the drive to apply (or: systemctl start '$mount_unit')."
+    [ "$mode" = normal ] && log "normal mode never auto-backs-up on insert — it just mounts; use 'borg-backup backup-now external' while it's plugged in"
+}
+
+cmd_arm_external() {
+    require_env
+    require_external
+    require_root
+
+    local choice="${1:-real}" target
+    case "$choice" in
+        real) target=borg-external-backup.service ;;
+        test) target=borg-external-mount-test.service ;;
+        *) die "usage: borg-backup arm-external [real|test]" ;;
+    esac
+
+    log "arming external drive: udev target -> $target"
+    write_udev_rule "${MOUNT_MODE:-managed}" "$target"
+
+    if grep -q '^ARM_TARGET=' "$EXISTING_ENV"; then
+        run sed -i "s/^ARM_TARGET=.*/ARM_TARGET=$target/" "$EXISTING_ENV"
+    elif $DRY_RUN; then
+        echo "[dry-run] append ARM_TARGET=$target to $EXISTING_ENV"
+    else
+        echo "ARM_TARGET=$target" >> "$EXISTING_ENV"
+    fi
+
+    if [ "${MOUNT_MODE:-managed}" = normal ]; then
+        log "done, but mount mode is 'normal' — insert never auto-backs-up there; switch to managed to take effect, or: systemctl start $target"
+    else
+        log "done. plug/unplug the drive to test, or: systemctl start $target"
+    fi
+    [ "$choice" = real ] && warn "this now runs real borg backups on insert (once in managed mode) — verify with 'test' first if you haven't"
+}
+
+cmd_backup_now() {
+    require_env
+    require_root
+    local target="${1:-local}"
+    case "$target" in
+        local) run systemctl start borg-local-backup.service ;;
+        external) require_external; run systemctl start borg-external-backup.service ;;
+        *) die "usage: borg-backup backup-now [local|external]" ;;
+    esac
+    log "started borg-$target-backup.service — see: journalctl -u borg-$target-backup.service -f"
+}
+
+cmd_notify_test() {
+    require_env
+    [ -n "${NOTIFY_USER:-}" ] || die "NOTIFY_USER is not set in $EXISTING_ENV"
+    /usr/local/sbin/borg-notify.sh "borg-backup" "test notification for $NOTIFY_USER"
+    log "sent — if nothing popped up, check notify-send is installed and $NOTIFY_USER is logged into a graphical session"
+}
+
+cmd_check_now() {
+    require_env
+    require_root
+    local target="${1:-local}"
+    case "$target" in
+        local) run systemctl start borg-check-local.service ;;
+        external) die "no standalone external check — it runs automatically inside a backup, throttled by CHECK_INTERVAL_DAYS" ;;
+        *) die "usage: borg-backup check-now [local]" ;;
+    esac
+    log "started borg-check-local.service — see: journalctl -u borg-check-local.service -f"
+}
+
+# --- dispatch ---
+ARGS=()
+for arg in "$@"; do
+    case "$arg" in
+        --dry-run) DRY_RUN=true ;;
+        *) ARGS+=("$arg") ;;
+    esac
+done
+
+if [ ${#ARGS[@]} -eq 0 ]; then
+    CMD=help
+else
+    CMD="${ARGS[0]}"
+    ARGS=("${ARGS[@]:1}")
+fi
+
+command -v systemctl >/dev/null 2>&1 || die "systemd not found"
+
+case "$CMD" in
+    setup) cmd_setup "${ARGS[@]}" ;;
+    status) cmd_status "${ARGS[@]}" ;;
+    test) cmd_test "${ARGS[@]}" ;;
+    mount-mode) cmd_mount_mode "${ARGS[@]}" ;;
+    arm-external) cmd_arm_external "${ARGS[@]}" ;;
+    backup-now) cmd_backup_now "${ARGS[@]}" ;;
+    check-now) cmd_check_now "${ARGS[@]}" ;;
+    notify-test) cmd_notify_test "${ARGS[@]}" ;;
+    help|-h|--help) usage ;;
+    *) die "unknown command: $CMD (see: borg-backup help)" ;;
+esac

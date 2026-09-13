@@ -1,0 +1,11 @@
+[Unit]
+Description=Borg backup (external repository)
+Requires=@MOUNT_UNIT@
+After=@MOUNT_UNIT@
+OnFailure=borg-notify-failure@%n.service
+
+[Service]
+Type=oneshot
+Nice=19
+IOSchedulingClass=idle
+ExecStart=/usr/local/sbin/borg-external-backup.sh

@@ -1,0 +1,10 @@
+[Unit]
+Description=Monthly Borg integrity check - local repository
+
+[Timer]
+OnCalendar=monthly
+RandomizedDelaySec=6h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
