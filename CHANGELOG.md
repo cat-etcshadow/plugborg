@@ -23,3 +23,7 @@ fixes found via vm-isolated fault-injection testing (see plan in session notes):
   false `OnFailure` notification for a routine, expected condition
 - document that journald can drop a failing unit's own log lines when the
   disk is 100% full, so `journalctl` comes back empty right when it matters
+- `mount-mode` applies the switch itself when the drive is plugged in, by
+  replaying its udev insert event (`udevadm trigger --action=add`) instead
+  of telling you to unplug/replug; asks first when switching to `managed`
+  since that starts the armed target, and skips it during a running backup

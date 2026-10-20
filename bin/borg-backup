@@ -689,11 +689,41 @@ cmd_mount_mode() {
 
     run systemctl daemon-reload
 
-    local mount_unit
-    mount_unit=$(systemd-escape --path --suffix=mount "$EXTERNAL_MOUNT")
     echo
-    log "mount mode set to '$mode'. unplug/replug the drive to apply (or: systemctl start '$mount_unit')."
+    log "mount mode set to '$mode'"
     [ "$mode" = normal ] && log "normal mode never auto-backs-up on insert — it just mounts; use 'borg-backup backup-now external' while it's plugged in"
+    apply_mount_mode "$mode" "$target"
+}
+
+# apply_mount_mode <mode> <target_service> - makes the just-written udev rule
+# take effect on an already-plugged drive. the fstab/env/unit changes are live
+# after daemon-reload; only the rule waits for the drive's next "add" event, so
+# replay that event - it starts exactly what a physical replug would. in
+# managed mode that is the armed target (possibly a real backup), so ask first
+apply_mount_mode() {
+    local mode="$1" target="$2" dev="/dev/disk/by-uuid/$EXTERNAL_FS_UUID" mount_unit
+    mount_unit=$(systemd-escape --path --suffix=mount "$EXTERNAL_MOUNT")
+
+    if [ ! -e "$dev" ]; then
+        log "drive is not plugged in — the new mode takes effect on its next insert"
+        return 0
+    fi
+    if systemctl is-active --quiet borg-external-backup.service; then
+        warn "external backup is running — leaving the drive alone; the new mode takes effect on its next insert"
+        return 0
+    fi
+
+    if [ "$mode" = managed ]; then
+        if ! confirm "drive is plugged in — replay its insert event now? (starts $target)" n; then
+            log "not applied — unplug/replug the drive, or: systemctl start $target"
+            return 0
+        fi
+    else
+        log "drive is plugged in — replaying its insert event so it mounts under the new mode"
+    fi
+    run udevadm trigger --settle --action=add "$dev"
+    [ "$mode" = normal ] && log "mounted at $EXTERNAL_MOUNT (unit: $mount_unit)"
+    return 0
 }
 
 cmd_arm_external() {

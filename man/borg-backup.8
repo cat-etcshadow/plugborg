@@ -103,6 +103,11 @@ switches it: updates the
 .I /etc/fstab
 options, re-renders the udev rule, and updates
 .IR /etc/borg/borg-backup.env .
+If the drive is plugged in, replays its udev insert event so the new
+mode takes effect right away; switching to
+.B managed
+asks first, since that starts the armed target (see
+.BR arm-external ).
 See MOUNT MODES below.
 .TP
 .BI "arm-external " "[real|test]"
@@ -256,8 +261,17 @@ yanked \- see TROUBLESHOOTING section 4.
 .PP
 Switch with
 .BR "borg-backup mount-mode managed" " or " "borg-backup mount-mode normal" ;
-apply immediately by unplugging and replugging the drive, or by
-starting its mount unit directly.
+the fstab, env and unit changes are live immediately. The udev rule
+only runs on the drive's next insert event, so if the drive is plugged
+in the command replays that event for you (via
+.BR "udevadm trigger" ),
+which does exactly what a physical replug would: in
+.B normal
+mode it just mounts; in
+.B managed
+mode it starts the armed target, so you are asked before it runs. While
+an external backup is running the drive is left alone. If the drive is
+not plugged in, the new mode simply applies on its next insert.
 .PP
 .B ARM_TARGET
 (managed mode only \- see EXTERNAL DRIVE VERIFICATION) has no effect
